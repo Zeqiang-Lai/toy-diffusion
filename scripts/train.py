@@ -16,8 +16,8 @@ diffusion = GaussianDiffusion(
 
 trainer = Trainer(
     diffusion,
-    'celeba/img_align_celeba',
-    results_folder='celeba_results',
+    'data/celeba',
+    results_folder='log/celeba',
     train_batch_size=32,
     train_lr=1e-4,
     train_num_steps=700000,         # total training steps

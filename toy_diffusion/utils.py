@@ -31,3 +31,7 @@ def convert_image_to(img_type, image):
     if image.mode != img_type:
         return image.convert(img_type)
     return image
+
+def model_size(model):
+    total = sum([param.nelement() for param in model.parameters()])
+    return total/1e6

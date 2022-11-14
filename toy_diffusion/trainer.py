@@ -10,8 +10,8 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import utils
 from tqdm.auto import tqdm
 
-from toy_diffusion.utils import has_int_squareroot, cycle, exists, num_to_groups
-
+from toy_diffusion.utils import has_int_squareroot, cycle, exists, num_to_groups, model_size
+from toy_diffusion.dataset import ImageFolderDataset
 
 class Trainer(object):
     def __init__(
@@ -27,7 +27,8 @@ class Trainer(object):
         ema_update_every=10,
         ema_decay=0.995,
         adam_betas=(0.9, 0.99),
-        save_and_sample_every=1000,
+        save_every=5000,
+        sample_every=500,
         num_samples=25,
         results_folder='./results',
         amp=False,
@@ -45,10 +46,12 @@ class Trainer(object):
         self.accelerator.native_amp = amp
 
         self.model = diffusion_model
+        self.accelerator.print('Model size = {}M'.format(model_size(self.model)))
 
         assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
         self.num_samples = num_samples
-        self.save_and_sample_every = save_and_sample_every
+        self.save_every = save_every
+        self.sample_every = sample_every
 
         self.batch_size = train_batch_size
         self.gradient_accumulate_every = gradient_accumulate_every
@@ -58,7 +61,7 @@ class Trainer(object):
 
         # dataset and dataloader
 
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip=augment_horizontal_flip, convert_image_to=convert_image_to)
+        self.ds = ImageFolderDataset(folder, self.image_size, augment_horizontal_flip=augment_horizontal_flip, convert_image_to=convert_image_to)
         dl = DataLoader(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=cpu_count())
 
         dl = self.accelerator.prepare(dl)
@@ -74,7 +77,7 @@ class Trainer(object):
             self.ema = EMA(diffusion_model, beta=ema_decay, update_every=ema_update_every)
 
             self.results_folder = Path(results_folder)
-            self.results_folder.mkdir(exist_ok=True)
+            self.results_folder.mkdir(exist_ok=True, parents=True)
 
         # step counter state
 
@@ -83,6 +86,7 @@ class Trainer(object):
         # prepare model, dataloader, optimizer with accelerator
 
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+    
 
     def save(self, milestone):
         if not self.accelerator.is_local_main_process:
@@ -145,16 +149,18 @@ class Trainer(object):
                     self.ema.to(device)
                     self.ema.update()
 
-                    if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                    if self.step != 0 and self.step % self.sample_every == 0:
                         self.ema.ema_model.eval()
 
                         with torch.no_grad():
-                            milestone = self.step // self.save_and_sample_every
+                            milestone = self.step // self.sample_every
                             batches = num_to_groups(self.num_samples, self.batch_size)
                             all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
 
                         all_images = torch.cat(all_images_list, dim=0)
                         utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow=int(math.sqrt(self.num_samples)))
+                        
+                    if self.step != 0 and self.step % self.save_every == 0:
                         self.save(milestone)
 
                 self.step += 1
