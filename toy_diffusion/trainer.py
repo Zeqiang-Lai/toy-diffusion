@@ -6,7 +6,8 @@ import torch
 from accelerate import Accelerator
 from ema_pytorch import EMA
 from torch.optim import Adam
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+import torch.utils.tensorboard as tensorboard
 from torchvision import utils
 from tqdm.auto import tqdm
 
@@ -34,7 +35,8 @@ class Trainer(object):
         amp=False,
         fp16=False,
         split_batches=True,
-        convert_image_to=None
+        convert_image_to=None,
+        enable_tensorboard=True,
     ):
         super().__init__()
 
@@ -86,7 +88,9 @@ class Trainer(object):
         # prepare model, dataloader, optimizer with accelerator
 
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
-    
+        
+        self.enable_tensorboard = enable_tensorboard
+        self.tb_writer = tensorboard.SummaryWriter(log_dir=self.results_folder / 'tb')
 
     def save(self, milestone):
         if not self.accelerator.is_local_main_process:
@@ -102,8 +106,12 @@ class Trainer(object):
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
-    def load(self, milestone):
-        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'))
+    def load(self, milestone, ignore_if_not_exists=False):
+        path = self.results_folder / f'model-{milestone}.pt'
+        if ignore_if_not_exists and not path.exists():
+            return 
+        
+        data = torch.load(str(path))
 
         model = self.accelerator.unwrap_model(self.model)
         model.load_state_dict(data['model'])
@@ -114,6 +122,9 @@ class Trainer(object):
 
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
+            
+        self.accelerator.print(f'Load ckpt from {path} \n step = {self.step}')
+        
 
     def train(self):
         accelerator = self.accelerator
@@ -137,7 +148,9 @@ class Trainer(object):
 
                 accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
                 pbar.set_description(f'loss: {total_loss:.4f}')
-
+                if self.enable_tensorboard:
+                    self.tb_writer.add_scalar('loss', total_loss, self.step)
+                
                 accelerator.wait_for_everyone()
 
                 self.opt.step()
@@ -161,7 +174,7 @@ class Trainer(object):
                         utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow=int(math.sqrt(self.num_samples)))
                         
                     if self.step != 0 and self.step % self.save_every == 0:
-                        self.save(milestone)
+                        self.save('last')
 
                 self.step += 1
                 pbar.update(1)
