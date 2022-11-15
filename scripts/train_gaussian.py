@@ -4,7 +4,7 @@ from toy_diffusion import GaussianDiffusion, Trainer
 
 def main(results_folder):
     model = Unet(
-        dim=32,
+        dim=64,
         dim_mults=(1, 2, 4, 8)
     )
 
@@ -21,8 +21,8 @@ def main(results_folder):
         'data/celeba',           
         results_folder=results_folder,    
         num_samples=16,                 
-        train_batch_size=4,             
-        gradient_accumulate_every=4,  
+        train_batch_size=32,             
+        gradient_accumulate_every=2,  
         train_lr=1e-4,                 
         save_every=1000,              
         sample_every=1000,              
