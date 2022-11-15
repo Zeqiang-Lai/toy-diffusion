@@ -2,7 +2,7 @@ import torchvision.utils as utils
 import imageio
 import torch
 from torchvision.utils import save_image
-from toy_diffusion.model.unet_g import Unet
+from toy_diffusion.model.unet import Unet
 from toy_diffusion import GaussianDiffusion
 
 model = Unet(

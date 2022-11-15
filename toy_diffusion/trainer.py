@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 from toy_diffusion.utils import has_int_squareroot, cycle, exists, num_to_groups, model_size
 from toy_diffusion.dataset import ImageFolderDataset
 
+
 class Trainer(object):
     def __init__(
         self,
@@ -80,6 +81,10 @@ class Trainer(object):
 
             self.results_folder = Path(results_folder)
             self.results_folder.mkdir(exist_ok=True, parents=True)
+            self.ckpt_folder = self.results_folder / 'ckpt'
+            self.ckpt_folder.mkdir(exist_ok=True, parents=True)
+            self.sample_folder = self.results_folder / 'sample'
+            self.sample_folder.mkdir(exist_ok=True, parents=True)
 
         # step counter state
 
@@ -88,7 +93,7 @@ class Trainer(object):
         # prepare model, dataloader, optimizer with accelerator
 
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
-        
+
         self.enable_tensorboard = enable_tensorboard
         self.tb_writer = tensorboard.SummaryWriter(log_dir=self.results_folder / 'tb')
 
@@ -104,13 +109,13 @@ class Trainer(object):
             'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
         }
 
-        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+        torch.save(data, str(self.ckpt_folder / f'model-{milestone}.pt'))
 
     def load(self, milestone, ignore_if_not_exists=False):
-        path = self.results_folder / f'model-{milestone}.pt'
+        path = self.ckpt_folder / f'model-{milestone}.pt'
         if ignore_if_not_exists and not path.exists():
-            return 
-        
+            return
+
         data = torch.load(str(path))
 
         model = self.accelerator.unwrap_model(self.model)
@@ -122,9 +127,8 @@ class Trainer(object):
 
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
-            
+
         self.accelerator.print(f'Load ckpt from {path} \n step = {self.step}')
-        
 
     def train(self):
         accelerator = self.accelerator
@@ -150,7 +154,7 @@ class Trainer(object):
                 pbar.set_description(f'loss: {total_loss:.4f}')
                 if self.enable_tensorboard:
                     self.tb_writer.add_scalar('loss', total_loss, self.step)
-                
+
                 accelerator.wait_for_everyone()
 
                 self.opt.step()
@@ -171,8 +175,8 @@ class Trainer(object):
                             all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
 
                         all_images = torch.cat(all_images_list, dim=0)
-                        utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow=int(math.sqrt(self.num_samples)))
-                        
+                        utils.save_image(all_images, str(self.sample_folder / f'sample-{milestone}.png'), nrow=int(math.sqrt(self.num_samples)))
+
                     if self.step != 0 and self.step % self.save_every == 0:
                         self.save('last')
 

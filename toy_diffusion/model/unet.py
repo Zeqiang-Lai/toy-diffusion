@@ -1,14 +1,15 @@
 from functools import partial
 
 import torch
-from einops import rearrange
+import torch.nn.functional as F
+from einops import rearrange, reduce
 from torch import nn
 
+
+from toy_diffusion.utils import default, exists
 from toy_diffusion.model.attention import Attention, LinearAttention
 from toy_diffusion.model.norm import PreNorm
-from toy_diffusion.model.pos_emb import LearnedSinusoidalPosEmb
-from toy_diffusion.utils import default, exists
-
+from toy_diffusion.model.pos_emb import RandomOrLearnedSinusoidalPosEmb, SinusoidalPosEmb
 
 # small helper modules
 
@@ -33,12 +34,29 @@ def Downsample(dim, dim_out=None):
     return nn.Conv2d(dim, default(dim_out, dim), 4, 2, 1)
 
 
+class WeightStandardizedConv2d(nn.Conv2d):
+    """
+    https://arxiv.org/abs/1903.10520
+    weight standardization purportedly works synergistically with group normalization
+    """
+
+    def forward(self, x):
+        eps = 1e-5 if x.dtype == torch.float32 else 1e-3
+
+        weight = self.weight
+        mean = reduce(weight, 'o ... -> o 1 1 1', 'mean')
+        var = reduce(weight, 'o ... -> o 1 1 1', partial(torch.var, unbiased=False))
+        normalized_weight = (weight - mean) * (var + eps).rsqrt()
+
+        return F.conv2d(x, normalized_weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+
 # building block modules
 
 class Block(nn.Module):
     def __init__(self, dim, dim_out, groups=8):
         super().__init__()
-        self.proj = nn.Conv2d(dim, dim_out, 3, padding=1)
+        self.proj = WeightStandardizedConv2d(dim, dim_out, 3, padding=1)
         self.norm = nn.GroupNorm(groups, dim_out)
         self.act = nn.SiLU()
 
@@ -88,20 +106,22 @@ class Unet(nn.Module):
         self,
         dim,
         init_dim=None,
+        out_dim=None,
         dim_mults=(1, 2, 4, 8),
         channels=3,
-        bits=8,
+        self_condition=False,
         resnet_block_groups=8,
+        learned_sinusoidal_cond=False,
+        random_fourier_features=False,
         learned_sinusoidal_dim=16
     ):
         super().__init__()
 
         # determine dimensions
 
-        channels *= bits
         self.channels = channels
-
-        input_channels = channels * 2
+        self.self_condition = self_condition
+        input_channels = channels * (2 if self_condition else 1)
 
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding=3)
@@ -115,8 +135,14 @@ class Unet(nn.Module):
 
         time_dim = dim * 4
 
-        sinu_pos_emb = LearnedSinusoidalPosEmb(learned_sinusoidal_dim)
-        fourier_dim = learned_sinusoidal_dim + 1
+        self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
+
+        if self.random_or_learned_sinusoidal_cond:
+            sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(learned_sinusoidal_dim, random_fourier_features)
+            fourier_dim = learned_sinusoidal_dim + 1
+        else:
+            sinu_pos_emb = SinusoidalPosEmb(dim)
+            fourier_dim = dim
 
         self.time_mlp = nn.Sequential(
             sinu_pos_emb,
@@ -156,13 +182,16 @@ class Unet(nn.Module):
                 Upsample(dim_out, dim_in) if not is_last else nn.Conv2d(dim_out, dim_in, 3, padding=1)
             ]))
 
+        default_out_dim = channels
+        self.out_dim = default(out_dim, default_out_dim)
+
         self.final_res_block = block_klass(dim * 2, dim, time_emb_dim=time_dim)
-        self.final_conv = nn.Conv2d(dim, channels, 1)
+        self.final_conv = nn.Conv2d(dim, self.out_dim, 1)
 
     def forward(self, x, time, x_self_cond=None):
-
-        x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
-        x = torch.cat((x_self_cond, x), dim=1)
+        if self.self_condition:
+            x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
+            x = torch.cat((x_self_cond, x), dim=1)
 
         x = self.init_conv(x)
         r = x.clone()
@@ -199,3 +228,27 @@ class Unet(nn.Module):
 
         x = self.final_res_block(x, t)
         return self.final_conv(x)
+
+
+class UnetG(Unet):
+    def __init__(
+        self,
+        dim,
+        init_dim=None,
+        out_dim=None,
+        dim_mults=(1, 2, 4, 8),
+        channels=3,
+        self_condition=False,
+        resnet_block_groups=8,
+        learned_sinusoidal_cond=False,
+        random_fourier_features=False,
+        learned_sinusoidal_dim=16,
+        learned_variance=False,
+    ):
+        super().__init__(
+            dim, init_dim, out_dim, dim_mults, channels,
+            self_condition, resnet_block_groups, learned_sinusoidal_cond, random_fourier_features, learned_sinusoidal_dim
+        )
+        default_out_dim = channels * (1 if not learned_variance else 2)
+        self.out_dim = default(out_dim, default_out_dim)
+        self.final_conv = nn.Conv2d(dim, self.out_dim, 1)
