@@ -2,13 +2,12 @@ import numpy as np
 import torch
 import torchmetrics
 import torch.nn.functional as F
+import math
 from torch import nn
 from torch.cuda.amp import autocast
 from tqdm import tqdm
 
 
-from ...utils.misc import instantiate_from_config
-from .schedule import alpha_schedule, cos_alpha_schedule
 
 eps = 1e-8
 
@@ -58,53 +57,81 @@ def multinomial_kl(log_prob1, log_prob2):   # compute KL loss on log_prob
     kl = (log_prob1.exp() * (log_prob1 - log_prob2)).sum(dim=1)
     return kl
 
+# scheduler
+
+def cos_alpha_schedule(time_step, N=100, att_1=0.99999, att_T=0.000009, ctt_1=0.000009, ctt_T=0.99999, exp=3):
+    att = np.arange(0, time_step)
+    att = (np.cos((att + time_step) * math.pi * 0.5 / time_step) + 1)**exp
+    att = att * (att_1 - att_T) + att_T
+    att = np.concatenate(([1], att))
+    at = att[1:] / att[:-1]
+
+    ctt = np.arange(0, time_step)
+    ctt = (np.cos((ctt + time_step) * math.pi * 0.5 / time_step) + 1)**exp
+    ctt = ctt * (ctt_1 - ctt_T) + ctt_T
+    ctt = np.concatenate(([0], ctt))
+
+    one_minus_ctt = 1 - ctt
+    one_minus_ct = one_minus_ctt[1:] / one_minus_ctt[:-1]
+    ct = 1 - one_minus_ct
+    bt = (1 - at - ct) / N
+    att = np.concatenate((att[1:], [1]))
+    ctt = np.concatenate((ctt[1:], [0]))
+    btt = (1 - att - ctt) / N
+    return at, bt, ct, att, btt, ctt
+
+
+def alpha_schedule(time_step, N=100, att_1=0.99999, att_T=0.000009, ctt_1=0.000009, ctt_T=0.99999):
+    att = np.arange(0, time_step) / (time_step - 1) * (att_T - att_1) + att_1
+    att = np.concatenate(([1], att))
+    at = att[1:] / att[:-1]
+    ctt = np.arange(0, time_step) / (time_step - 1) * (ctt_T - ctt_1) + ctt_1
+    ctt = np.concatenate(([0], ctt))
+    one_minus_ctt = 1 - ctt
+    one_minus_ct = one_minus_ctt[1:] / one_minus_ctt[:-1]
+    ct = 1 - one_minus_ct
+    bt = (1 - at - ct) / N
+    att = np.concatenate((att[1:], [1]))
+    ctt = np.concatenate((ctt[1:], [0]))
+    btt = (1 - att - ctt) / N
+    return at, bt, ct, att, btt, ctt
+
+
     
 class DiscreteDiffusion(nn.Module):
     def __init__(
         self,
+        model,
         *,
-        content_emb_config=None,
-        condition_emb_config=None,
-        transformer_config=None,
-
-        diffusion_step=100,
-        alpha_init_type='alpha1',
+        num_classes,
+        image_size=32,
+        timesteps=100,
+        alpha_schedule='alpha1',
         auxiliary_loss_weight=0,
         adaptive_auxiliary_loss=False,
         mask_weight=[1, 1],
         sample_time_method='uniform',
-        sample_shape=[32, 32],
         loss_type='vb_stochastic',
         parametrization='x0',
     ):
         super().__init__()
 
-        if condition_emb_config is None:
-            self.condition_emb = None
-        else:
-            # for condition and config, we learn a seperate embedding
-            self.condition_emb = instantiate_from_config(condition_emb_config)
-            # self.condition_dim = self.condition_emb.embed_dim
-
-        transformer_config['params']['content_emb_config'] = content_emb_config
-
-        self.transformer = instantiate_from_config(transformer_config)
-        # self.content_seq_len = transformer_config['params']['content_seq_len']
+        self.model = model
         self.amp = False
 
-        self.num_classes = self.transformer.content_emb.num_embed
+        self.num_classes = num_classes
         self.loss_type = loss_type
-        self.shape = sample_shape
-        self.num_timesteps = diffusion_step
+        self.shape = image_size
+        self.num_timesteps = timesteps
         self.parametrization = parametrization
         self.auxiliary_loss_weight = auxiliary_loss_weight
         self.adaptive_auxiliary_loss = adaptive_auxiliary_loss
         self.mask_weight = mask_weight
         self.sample_time_method = sample_time_method
 
-        if alpha_init_type == "alpha1":
+        if alpha_schedule == "alpha1":
             at, bt, ct, att, btt, ctt = alpha_schedule(self.num_timesteps, N=self.num_classes - 1)
-        elif alpha_init_type == 'cos':
+        elif alpha_schedule == 'cos':
             at, bt, ct, att, btt, ctt = cos_alpha_schedule(self.num_timesteps, N=self.num_classes - 1)
         else:
             print("alpha_init_type is Wrong !! ")
@@ -173,7 +200,7 @@ class DiscreteDiffusion(nn.Module):
     def predict_start(self, log_x_t, cond_emb, t):          # p(x0|xt)
         x_t = log_onehot_to_index(log_x_t)
 
-        out = self.transformer(x_t, cond_emb, t)
+        out = self.model(x_t, cond_emb, t)
 
         assert out.size(0) == x_t.size(0)
         assert out.size(1) == self.num_classes - 1
@@ -371,7 +398,7 @@ class DiscreteDiffusion(nn.Module):
 
     @property
     def device(self):
-        return self.transformer.device
+        return next(self.model.parameters()).device
 
     def parameters(self, recurse=True, name=None):
         """
@@ -415,7 +442,7 @@ class DiscreteDiffusion(nn.Module):
                                 no_decay.add('{}.{}'.format(mn, pn))
 
             # validate that we considered every parameter
-            param_dict = {pn: p for pn, p in self.transformer.named_parameters()}  # if p.requires_grad}
+            param_dict = {pn: p for pn, p in self.model.named_parameters()}  # if p.requires_grad}
             inter_params = decay & no_decay
             union_params = decay | no_decay
             assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
@@ -477,175 +504,6 @@ class DiscreteDiffusion(nn.Module):
             out['acc'] = acc
         self.amp = False
         return out
-
-    #TODO: remove
-    def sample_old(
-        self,
-        condition_token,
-        condition_mask,
-        condition_embed,
-        content_token=None,
-        filter_ratio=0.5,
-        temperature=1.0,
-        return_att_weight=False,
-        return_logits=False,
-        content_logits=None,
-        return_x_start=False,
-        return_timestep=0,
-        use_init=False,
-        **kwargs
-    ):
-        input = {'condition_token': condition_token,
-                 'content_token': content_token,
-                 'condition_mask': condition_mask,
-                 'condition_embed_token': condition_embed,
-                 'content_logits': content_logits,
-                 }
-
-        if input['condition_token'] != None:
-            batch_size = input['condition_token'].shape[0]
-        else:
-            batch_size = kwargs['batch_size']
-
-        device = self.log_at.device
-        start_step = int(self.num_timesteps * filter_ratio)
-
-        # get cont_emb and cond_emb
-        if content_token != None:
-            sample_content = input['content_token'].type_as(input['content_token'])
-            self.shape = content_token.shape[1:]
-
-        if self.condition_emb is not None:  # do this
-            with torch.no_grad():
-                cond_emb = self.condition_emb(input['condition_token'])  # B x Ld x D   #256*1024
-            cond_emb = cond_emb
-        else:  # share condition embeding with content
-            if input.get('condition_embed_token', None) != None:
-                cond_emb = input['condition_embed_token']
-            else:
-                cond_emb = None
-
-        if start_step == 0:
-            # use full mask sample
-            zero_logits = torch.zeros((batch_size, self.num_classes - 1, *self.shape), device=device)
-            one_logits = torch.ones((batch_size, 1, *self.shape), device=device)
-            mask_logits = torch.cat((zero_logits, one_logits), dim=1)
-            log_z = torch.log(mask_logits)
-            start_step = self.num_timesteps
-            with torch.no_grad():
-                for diffusion_index in range(start_step - 1, -1, -1):
-                    t = torch.full((batch_size,), diffusion_index, device=device, dtype=torch.long)
-                    if diffusion_index == start_step - 1 and use_init:
-                        out = self.p_sample_with_x0(content_token, log_z, cond_emb, t, return_x_start)
-                    else:
-                        out = self.p_sample(log_z, cond_emb, t, return_x_start)
-                    # out = self.p_sample(log_z, cond_emb, t, return_x_start)     # log_z is log_onehot
-                    if return_x_start:
-                        log_z, log_x_recon = out
-                    else:
-                        log_z = out
-                    if diffusion_index == return_timestep:
-                        break
-        else:
-            t = torch.full((batch_size,), start_step - 1, device=device, dtype=torch.long)
-            log_x_start = index_to_log_onehot(sample_content, self.num_classes)
-            log_xt = self.q_sample(log_x_start=log_x_start, t=t)
-
-            log_z = log_xt
-            with torch.no_grad():
-                for diffusion_index in range(start_step - 1, -1, -1):
-                    t = torch.full((batch_size,), diffusion_index, device=device, dtype=torch.long)
-                    out = self.p_sample(log_z, cond_emb, t, return_x_start)     # log_z is log_onehot
-                    if return_x_start:
-                        log_z, log_x_recon = out
-                    else:
-                        log_z = out
-                    if diffusion_index == return_timestep:
-                        break
-
-        if return_x_start:
-            content_token = log_onehot_to_index(log_x_recon)
-        else:
-            content_token = log_onehot_to_index(log_z)
-
-        output = {'content_token': content_token}
-
-        if return_logits:
-            if return_x_start:
-                output['logits'] = torch.exp(log_x_recon)
-            else:
-                output['logits'] = torch.exp(log_z)
-        return output
-
-    #TODO: remove
-    def sample_fast_old(
-        self,
-        condition_token,
-        condition_mask,
-        condition_embed,
-        content_token=None,
-        filter_ratio=0.5,
-        temperature=1.0,
-        return_att_weight=False,
-        return_logits=False,
-        content_logits=None,
-        print_log=True,
-        skip_step=1,
-        **kwargs
-    ):
-        input = {'condition_token': condition_token,
-                 'content_token': content_token,
-                 'condition_mask': condition_mask,
-                 'condition_embed_token': condition_embed,
-                 'content_logits': content_logits,
-                 }
-
-        batch_size = input['condition_token'].shape[0]
-        device = self.log_at.device
-        start_step = int(self.num_timesteps * filter_ratio)
-
-        # get cont_emb and cond_emb
-        if content_token != None:
-            sample_image = input['content_token'].type_as(input['content_token'])
-
-        if self.condition_emb is not None:
-            with torch.no_grad():
-                cond_emb = self.condition_emb(input['condition_token'])  # B x Ld x D   #256*1024
-            cond_emb = cond_emb.float()
-        else:  # share condition embeding with content
-            cond_emb = input['condition_embed_token'].float()
-
-        assert start_step == 0
-        zero_logits = torch.zeros((batch_size, self.num_classes - 1, self.shape), device=device)
-        one_logits = torch.ones((batch_size, 1, self.shape), device=device)
-        mask_logits = torch.cat((zero_logits, one_logits), dim=1)
-        log_z = torch.log(mask_logits)
-        start_step = self.num_timesteps
-        with torch.no_grad():
-            # skip_step = 1
-            diffusion_list = [index for index in range(start_step - 1, -1, -1 - skip_step)]
-            if diffusion_list[-1] != 0:
-                diffusion_list.append(0)
-            # for diffusion_index in range(start_step-1, -1, -1):
-            iterators = diffusion_list
-            if not self.training: iterators = tqdm(iterators)
-            for diffusion_index in iterators:
-
-                t = torch.full((batch_size,), diffusion_index, device=device, dtype=torch.long)
-                log_x_recon = self.predict_start(log_z, cond_emb, t)
-                if diffusion_index > skip_step:
-                    model_log_prob = self.q_posterior(log_x_start=log_x_recon, log_x_t=log_z, t=t - skip_step)
-                else:
-                    model_log_prob = self.q_posterior(log_x_start=log_x_recon, log_x_t=log_z, t=t)
-
-                log_z = self.log_sample_categorical(model_log_prob)
-
-        content_token = log_onehot_to_index(log_z)
-
-        output = {'content_token': content_token}
-        if return_logits:
-            output['logits'] = torch.exp(log_z)
-        return output
 
     @torch.no_grad()
     def sample(

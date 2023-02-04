@@ -1,24 +1,24 @@
 from toy_diffusion.model.unet import Unet
-from toy_diffusion import DiscreteDiffusion, Trainer
+from toy_diffusion import BitDiffusion, Trainer
 
 
 def main(results_folder):
     model = Unet(
         dim=64,
-        dim_mults=(1, 2, 4, 8)
+        dim_mults=(1, 2, 4, 8),
+        channels=8,
     )
 
-    diffusion = DiscreteDiffusion(
+    diffusion = BitDiffusion(
         model,
         image_size=128,
         timesteps=100, 
-        loss_type='l1',   
-        objective='pred_x0'
+        bit_scale=0.1,
     )
 
     trainer = Trainer(
         diffusion,
-        'data/celeba',           
+        'data/ade20k/annotations/training',           
         results_folder=results_folder,    
         num_samples=16,                 
         train_batch_size=32,             
@@ -35,7 +35,7 @@ def main(results_folder):
 
 
 if __name__ == '__main__':
-    results_folder = 'log/gaussian_diffusion'
+    results_folder = 'log/bit_diffusion_ade20k'
     
      # save training script for reproducible experiments
     import os, shutil
